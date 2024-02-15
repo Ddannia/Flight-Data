@@ -1,0 +1,820 @@
+---
+title: "Compare delays of US domestic flights"
+output:
+  word_document: default
+  pdf_document: default
+  html_document:
+    code_folding: hide
+date: "2024-01-30"
+---
+
+```{r knitr-setup, include = FALSE}
+library(knitr)
+library(shiny)
+library(ggplot2)
+library(dplyr)
+library(maptiles)
+library(sf)
+library(tidyterra)
+library(dplyr)
+library(magrittr)
+library(stringr)
+library(shiny)
+library(hrbrthemes)
+library(stats)
+library(ggridges)
+
+opts_chunk$set(echo = FALSE, include = FALSE, warning = FALSE)
+```
+## 1. Introduction
+Flight delays are a common occurrence, influenced by various factors. Jim, a manager at a prominent company, frequently travels domestically in the US to meet with business partners and suppliers, with key routes including:
+
+- ANC - PDX
+- PDX - BOS
+- BOS - SAN
+- JFK - SEA
+
+The airport names corresponding to the abbreviations are listed below:
+
+| Airport abbreviation | Airport name                                |
+|----------------------|---------------------------------------------|
+| ANC                  | Anchorage                                   |
+| PDX                  | Portland International Airport               |
+| BOS                  | Boston Logan International Airport           |
+| SAN                  | San Diego International Airport             |
+| JFK                  | John F. Kennedy International Airport New York |
+| SEA                  | Seattle-Tacoma International Airport        |
+
+Timeliness is critical for Jim, as missing meetings could have significant consequences. Therefore, our goal is to identify airlines with fewer delays. By conducting this analysis, we aim to help the company in reduce flight delays during Jim's business trips, thereby minimizing disruptions and save time and money. 
+
+Chapter two will focus on data retrieval and cleansing, followed by data visualization and analysis in chapters three and four, respectively. Chapter five will consolidate our findings and draw conclusions. The final chapter, chapter six, specifies the use of generative AI in our work.
+
+## 2. Data Preparation
+We obtained two data sets airports.csv and flights.csv from Kaggle.com. The first one includes all information regarding airport names and gps locations and the latter one contains all US domestic flights from 2015.[^1]
+
+[^1]: https://www.kaggle.com/datasets/usdot/flight-delays
+
+```{r getData, echo = FALSE, include= TRUE, cache = TRUE}
+
+## read the airports data into R
+airports <- read.csv('airports.csv', header=T, na.strings=c("","NA"))
+
+## Initially, we attempted to read the CSV data, but encountered significant delays in loading times.
+## Thus, we saved the read.csv as a saveRDS in our path for a faster load
+# flights <- read.csv('flights.csv', header=T, na.strings=c("","NA"))
+# saveRDS(object = flights, file = "flights.rds")
+flights <- readRDS(file = "flights.rds")
+head(airports) 
+head(flights)
+```
+
+### 2.1 Clean the data
+Since the aim of this project is not to build a precise model, we remove all entries that have missing values. We use the 'all_vars' function to apply 'filter_all' to all columns, excluding those columns that contain binary values, so the rows with a zero as binary value will not be removed.
+
+Furthermore, after investigating the 31 variables of the flights.csv file, we decided that the important columns for our analysis are the following:
+
+- YEAR
+- MONTH
+- DAY
+- DAY_OF_WEEK
+- AIRLINE
+- ORIGIN_AIRPORT
+- DESTINATION_AIRPORT
+- DEPARTURE_DELAY
+- DISTANCE
+- ARRIVAL_DELAY
+
+Therefore, we remove these columns:
+
+- FLIGHT_NUMBER
+- TAIL_NUMBER
+- SCHEDULED_DEPARTURE
+- DEPARTURE_TIME
+- TAXI_OUT
+- WHEELS_OFF
+- SCHEDULED_TIME
+- ELAPSED_TIME
+- AIR_TIME
+- WHEELS_ON
+- TAXI_IN
+- SCHEDULED_ARRIVAL
+- ARRIVAL_TIME
+- DIVERTED
+- CANCELLED
+- CANCELLATION_REASON
+- AIR_SYSTEM_DELAY
+- SECURITY_DELAY
+- AIRLINE_DELAY
+- LATE_AIRCRAFT_DELAY
+- WEATHER_DELAY
+
+```{r cleanData, echo = TRUE, include= TRUE}
+# remove irrelevant columns from data set
+flights.cleaned.from.columns <-
+  subset(
+    flights,
+    select = -c(
+      FLIGHT_NUMBER,
+      TAIL_NUMBER,
+      SCHEDULED_DEPARTURE,
+      DEPARTURE_TIME,
+      TAXI_OUT,
+      WHEELS_OFF,
+      SCHEDULED_TIME,
+      ELAPSED_TIME,
+      AIR_TIME,
+      WHEELS_ON,
+      TAXI_IN,
+      SCHEDULED_ARRIVAL,
+      ARRIVAL_TIME,
+      DIVERTED,
+      CANCELLATION_REASON,
+      AIR_SYSTEM_DELAY,
+      SECURITY_DELAY,
+      AIRLINE_DELAY,
+      LATE_AIRCRAFT_DELAY,
+      WEATHER_DELAY
+    )
+  )
+head(flights.cleaned.from.columns)
+
+# delete rows with empty fields
+flights.cleaned.from.columns [flights.cleaned.from.columns == ""] <- NA
+flights.cleaned <-
+  flights.cleaned.from.columns[complete.cases(flights.cleaned.from.columns),]
+```
+
+After deleting rows with missing values, we now want to make sure, that there are no missing values left. Therefore, we check for empty values in our cleaned data set.
+
+``` {r checkEmptyFields, echo = TRUE, include = TRUE}
+
+# check if the code worked: are there still any empty values?
+sum(is.na (flights.cleaned))
+
+# comparison with value before cleaning from NA
+sum(is.na (flights.cleaned.from.columns)) > sum(is.na (flights.cleaned))
+```
+The result is **TRUE**: There was at least one NA value in the data set "flights.cleaned.from.columns".
+
+In the next step, we investigate the unique departure airports of all flights. By looking at the tail of the data set we find out that there are numbers indicated as airport names. In fact, for all flights in October, the airport names are given as digits.   
+```{r airport names, echo=TRUE, include=TRUE}
+# find unique departure airports
+dep.airport.unique <-flights.cleaned %>%
+  distinct(ORIGIN_AIRPORT)
+# the unique airport name list contains numbers
+tail(dep.airport.unique)
+
+# filter for unique airport names for flights in October
+airportnames.october <- flights.cleaned %>%
+  filter(MONTH == 10) %>%
+  distinct(ORIGIN_AIRPORT)
+# airportnames.october contains only digits
+```
+
+This problem originates from the source data and may be caused by wrong data entry or encoding inconsistency. We need to remove these entries since the meaning of the digits cannot be explained. 
+```{r remove digital airport names, echo=TRUE}
+
+# delete rows that have numbers as airport name
+flights.filtered <- flights.cleaned %>%
+  filter(!grepl("\\d", ORIGIN_AIRPORT))
+
+# prove that the column ORIGIN_AIRPORT only contain characters
+any(!is.character(flights.cleaned$AIRLINE))
+```
+
+This leaves us with `r ncol(flights.filtered)` columns and `r nrow(flights.filtered)` rows.
+
+### 2.2 Determine the relevant subset
+Jim travels these routes the most frequently to visit suppliers and customers.
+
+- ANC - PDX
+- PDX - BOS
+- BOS - SAN
+- JFK - SEA
+
+In the following, we would like to filter the airlines that operate these routes.
+```{r routes, echo = TRUE, include=TRUE}
+# save all possible airlines as a vector
+airlines <- c("UA", "AA", "US", "F9", "B6", "OO", "AS", "NK", "WN", "DL", "EV", "HA", "MQ", "VX")
+# loop through the vector of airlines to find which one operates the desired routes
+results.list <- list()
+for (airline in airlines) {
+  # filter rows based on conditions (Note: route means round trip)
+  result <- flights.filtered[flights.filtered$AIRLINE == airline & 
+                      ((flights.filtered$ORIGIN_AIRPORT == "ANC" & flights.filtered$DESTINATION_AIRPORT == "PDX") |
+                     (flights.filtered$ORIGIN_AIRPORT == "PDX" & flights.filtered$DESTINATION_AIRPORT == "ANC") |
+                     (flights.filtered$ORIGIN_AIRPORT == "PDX" & flights.filtered$DESTINATION_AIRPORT == "BOS") |
+                     (flights.filtered$ORIGIN_AIRPORT == "BOS" & flights.filtered$DESTINATION_AIRPORT == "PDX") |
+                     (flights.filtered$ORIGIN_AIRPORT == "BOS" & flights.filtered$DESTINATION_AIRPORT == "SAN") |
+                     (flights.filtered$ORIGIN_AIRPORT == "SAN" & flights.filtered$DESTINATION_AIRPORT == "BOS") |
+                     (flights.filtered$ORIGIN_AIRPORT == "JFK" & flights.filtered$DESTINATION_AIRPORT == "SEA") |
+                     (flights.filtered$ORIGIN_AIRPORT == "SEA" & flights.filtered$DESTINATION_AIRPORT == "JFK")), ]
+  
+  # store the result in the list
+  results.list[[airline]] <- result
+}
+```
+The result.list contains four non-empty tables indicating that the airlines AS, B6, DL and AA satisfy at least one of the conditions regarding the routes. In the following we would like to filter for the airlines, that operate all the routes that are relevant to Jim's travel. We list the unique airports of departure and arrival of the four airlines.
+```{r}
+# airlines: AS, B6, DL, AA
+# check if these airlines indeed operate these routes
+unique.airport.list <- list()
+airline.routes <- c("AS", "B6", "DL", "AA")
+for (airline in airline.routes) {
+  result <- unique(results.list[[airline]][c("ORIGIN_AIRPORT", "DESTINATION_AIRPORT")])
+  unique.airport.list[[airline]] <- result
+}
+unique.airport.list
+
+```
+The above results show that the airlines AS (Alaska) and B6 (JetBlue) have all the routes in common. We therefore remove all entries that do not correspond to the desired routes and the desired airlines names. 
+```{r filterAirlines, echo = TRUE}
+# Set the conditions
+conditions <- 
+  (flights.filtered$ORIGIN_AIRPORT == "ANC" & flights.filtered$DESTINATION_AIRPORT == "PDX") |
+  (flights.filtered$ORIGIN_AIRPORT == "PDX" & flights.filtered$DESTINATION_AIRPORT == "ANC") |
+  (flights.filtered$ORIGIN_AIRPORT == "PDX" & flights.filtered$DESTINATION_AIRPORT == "BOS") |
+  (flights.filtered$ORIGIN_AIRPORT == "BOS" & flights.filtered$DESTINATION_AIRPORT == "PDX") |
+  (flights.filtered$ORIGIN_AIRPORT == "BOS" & flights.filtered$DESTINATION_AIRPORT == "SAN") |
+  (flights.filtered$ORIGIN_AIRPORT == "SAN" & flights.filtered$DESTINATION_AIRPORT == "BOS") |
+  (flights.filtered$ORIGIN_AIRPORT == "JFK" & flights.filtered$DESTINATION_AIRPORT == "SEA") |
+  (flights.filtered$ORIGIN_AIRPORT == "SEA" & flights.filtered$DESTINATION_AIRPORT == "JFK")
+
+# filter for Airlines AS And B6 and the conditions
+flights.subset <- flights.filtered %>%
+  filter(AIRLINE %in% c("AS", "B6") & conditions)
+flights.subset
+
+# check if there are other Airlines than AS and B6
+any(!flights.subset$AIRLINE %in% c('AS', 'B6'))
+
+# we get FALSE, so there are no other values than AS and B6 in the airline column
+
+```
+The resulting data set "flights.subset" contains all flights by Alaska and JetBlue with the respective routes.
+
+### 2.3 Combine data sets
+We also would like to know where the airports are located. Therefore, we combine the two data sets "flights.subset" and "airports" to one. We add the latitude and longitude of the airports.csv to our modified flights data set.
+
+We see that the airport data set has two columns for latitude and longitude, and each row represents one airport, we need to add four new columns to our flights.subset because flights.subset has two airports per row (incl. ORIGIN_AIRPORT and DESTINATION_AIRPORT). Therefore, we will add the following columns to the flights subset:
+
+- ORIGIN_LATITUDE 
+- ORIGIN_LONGITUDE
+- DESTINATION_LATITUDE
+- DESTINATION_LONGITUDE
+indicating the gps locations for both the origin and the destination airport.
+
+To make the data set more organized, we will put the origin coordinates directly after the column which includes the origin airport, and the destination coordinates directly after the column of destination airport.
+
+```{r combineDataSets, echo = FALSE, include= TRUE}
+
+# first we need to add the 4 new columns
+flights.added.column <- flights.subset %>%
+  mutate(
+    "ORIGIN_LATITUDE" = NA,
+    "ORIGIN_LONGITUDE" = NA,
+    .after = ORIGIN_AIRPORT
+  ) %>%
+  mutate( "DESTINATION_LATITUDE" = NA,
+    "DESTINATION_LONGITUDE" = NA,
+    .after = DESTINATION_AIRPORT)
+
+
+flights.with.coordinates <- flights.added.column %>%
+  # join with latitude for origin airports
+  left_join(airports %>% select(IATA_CODE, LATITUDE),
+            by = c("ORIGIN_AIRPORT" = "IATA_CODE")) %>%
+  mutate(ORIGIN_LATITUDE = if_else(is.na(LATITUDE), ORIGIN_LATITUDE, LATITUDE)) %>%
+  select(-LATITUDE) %>%
+  
+  # join with longitude for origin airports
+  left_join(airports %>% select(IATA_CODE, LONGITUDE),
+            by = c("ORIGIN_AIRPORT" = "IATA_CODE")) %>%
+  mutate(ORIGIN_LONGITUDE = if_else(is.na(LONGITUDE), ORIGIN_LONGITUDE, LONGITUDE)) %>%
+  select(-LONGITUDE) %>%
+  
+  # join with latitude for destination airports
+  left_join(airports %>% select(IATA_CODE, LATITUDE),
+            by = c("DESTINATION_AIRPORT" = "IATA_CODE")) %>%
+  mutate(DESTINATION_LATITUDE = if_else(is.na(LATITUDE), DESTINATION_LATITUDE, LATITUDE)) %>%
+  select(-LATITUDE)  %>%
+  
+  # join with longitude for destination airports
+  left_join(airports %>% select(IATA_CODE, LONGITUDE),
+            by = c("DESTINATION_AIRPORT" = "IATA_CODE")) %>%
+  mutate(DESTINATION_LONGITUDE = if_else(is.na(LONGITUDE), DESTINATION_LONGITUDE, LONGITUDE)) %>%
+  select(-LONGITUDE)
+
+# investigate the resulting joined data set
+added.colnames <- c("ORIGIN_LATITUDE", "ORIGIN_LONGITUDE", "DESTINATION_LATITUDE", "DESTINATION_LONGITUDE")
+head(flights.with.coordinates[, added.colnames])
+     
+```
+The resulting data set flights.with.coordinates is cleaned for missing values and contains all information we need for the visualization in the next chapter. 
+Note that the subset only contains flights, that are operated by AS (Alaska) and B6 (JetBlue) airlines with the routes, that are relevant to Jim's travel.
+
+## 3. Data Visualization
+In the following we visualize the data with the help of plots to gain an understanding of the data set. 
+
+### 3.1 Cumulative yearly and monthly flights
+In this sub chapter, we would like to have a look at the delay distribution of the two airlines both in 2015 and in each month of 2015. The data set contains both the DEPARTURE_DELAY and the ARRIVAL_DELAY. These values are obtained by:
+$$departure.delay = scheduled.departure.time-actual.departure.time$$
+$$arrival.delay = scheduled.arrival.time-actual.arrival.time.$$
+For the delay we will use the variable "ARRIVAL_DELAY" instead of the "DEPARTURE_DELAY", because the first one represents the actual delay, that a flight has. 
+
+#### 3.1.1 Delay distribution using barplot
+First, we plot the number of flights from AS and B6 both monthly and yearly in a bar plot.
+
+``` {r visualization, echo=TRUE, include = TRUE}
+# change the numerical value of the months to the actual month name and add it to a new column named MONTH_NAME
+flights.with.coordinates$MONTH_NAME <- factor(
+  flights.with.coordinates$MONTH,
+  levels = 1:12,
+  labels = c(
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December"
+  )
+)
+head(flights.with.coordinates$MONTH_NAME)
+
+
+# First, we look at the total flights of each airline in 2015
+ggplot(flights.with.coordinates, aes(x = AIRLINE, fill = AIRLINE)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Yearly flight Counts by Airline",
+       x = "Airline",
+       y = "Number of flights",
+       fill = "Airlines") +
+  scale_fill_manual(values = c("lightblue", "orange"))+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Then we create the bar plot for the monthly flights by airline
+ggplot(flights.with.coordinates, aes(x = MONTH_NAME, fill = AIRLINE)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Monthly Flight Counts by Airline",
+       x = "Month",
+       y = "Number of flights",
+       fill = "Airlines") +
+  scale_fill_manual(values = c("lightblue", "orange"))+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+The first plot indicates, that in total, Alaska operated more fights than JetBlue on the routes that are relevant to Jim's travel in 2015.
+
+The cumulative monthly flight plot indicates a difference between Alaska Airlines (AS) and JetBlue (B6). Specifically, Alaska airline (AS) operates the routes more consistently throughout the year. JetBlue operated these routes more frequently in the summer season, spanning from June to September. 
+
+As the data for flights in October are removed due to erroneous data the month October is not displayed in the plot.
+
+#### 3.1.2 Delay distribution using ridgeline plot
+We use a ridgeline plot To further investigate the delay by the airlines both yearly and monthly.
+
+##### 3.1.2.1 Compare the arrival delay of both airlines in 2015
+```{r ridgeline plot, echo = TRUE, include= TRUE}
+# create a ridgeline plot
+ggplot(flights.with.coordinates, aes(x = ARRIVAL_DELAY, y = AIRLINE, fill = AIRLINE)) +
+  geom_density_ridges(alpha = 0.7) +
+  theme_ridges() +
+  labs(title = "Delay Distribution of Flights (AS and B6)",
+       x = "Arrival Delay (minutes)",
+       y = "Airline") +
+  scale_fill_manual(values = c("AS" = "blue", "B6" = "orange"))
+
+```
+
+The delay distributions of both airlines show minimal differences. By looking at the distribution, we can see that they are leptokurtic meaning that the delay has higher concentration in the center and extreme values are less likely to occur compared to a normal distribution. The distributions are both slightly right-skewed which indicates that flights arriving later than scheduled tend to have larger delay values compared to those arriving earlier than scheduled.
+
+##### 3.1.2.2 Compare the arrival delay for each airline across the 12 months in 2015
+In the following we would like to investigate the delay distribution of in each month of 2015 for both airlines.
+```{r further plots, echo = TRUE, include= TRUE, fig.show='hold'}
+# create subset for Airline AS containing ARRIVAL_DELAY and MONTH data
+flights.AS.month <- flights.with.coordinates %>%
+  filter(AIRLINE == "AS") %>%
+  select(ARRIVAL_DELAY, MONTH)
+# create subset for Airline B6 containing ARRIVAL_DELAY and MONTH data
+flights.B6.month <- flights.with.coordinates %>%
+  filter(AIRLINE == "B6") %>%
+  select(ARRIVAL_DELAY, MONTH)
+
+# convert MONTH to a factor
+flights.AS.month$MONTH <- factor(flights.AS.month$MONTH)
+# convert MONTH to a factor
+flights.B6.month$MONTH <- factor(flights.B6.month$MONTH)
+
+# set limits for the x axis to enable comparison of the ridgeline plots
+x.limits <- c(-100, 400)
+y.limits <- c(-100, 600)
+
+# create a ridgeline plot for AS
+ggplot(flights.AS.month, aes(x = ARRIVAL_DELAY, y = MONTH, fill = MONTH)) +
+  geom_density_ridges(aes(height = after_stat(density)), alpha = 0.7, scale = 3) +
+  theme_ridges() +
+  labs(title = "Delay Distribution of Alaska Airline Flights Across 12 Months",
+       x = "Arrival Delay (minutes)",
+       y = "Month") +
+  lims(x = x.limits)
+
+# create a ridgeline plot for B6
+ggplot(flights.B6.month, aes(x = ARRIVAL_DELAY, y = MONTH, fill = MONTH)) +
+  geom_density_ridges(aes(height = after_stat(density)), alpha = 0.7, scale = 3) +
+  theme_ridges() +
+  labs(title = "Delay Distribution of JetBlue Airline Flights Across 12 Months",
+       x = "Arrival Delay (minutes)",
+       y = "Month") +
+  lims(x = x.limits)
+```
+
+When we look at the ridgeline plots comparing the flight delays of Alaska and JetBlue airlines, we don't see a clear difference. However, there's a subtle distinction: Alaska's delay distribution appears to have a slightly smaller center compared to JetBlue's. This suggests that JetBlue may experience larger delays than Alaska. Also, Alaska's delay distribution seems to be closer to a normal distribution, while JetBlue's is skewed to the right. This implies that JetBlue experiences longer positive delays (arriving later than scheduled) more likely than negative delays (arriving earlier than scheduled).
+
+#### 3.1.3 Summary Statistics
+To further investigate the distributions, we will examine specific statistical values for the delays of both airlines. Specifically, we will look at the summary statistics, the standard deviation, the IQR and the SEM (standard error of the mean).
+```{r summary statistics, echo = TRUE, include= TRUE}
+
+# create subset of airline AS
+flights.subset.AS <- flights.with.coordinates %>%
+  filter(AIRLINE=="AS") %>%
+  select(AIRLINE, ARRIVAL_DELAY)
+# create subset of airline B6
+flights.subset.B6 <- flights.with.coordinates %>%
+  filter(AIRLINE=="B6") %>%
+  select(AIRLINE, ARRIVAL_DELAY)
+
+# Summary Statistics
+summary(flights.subset.AS)
+summary(flights.subset.B6)
+
+# Standard Deviation
+sd(flights.subset.AS$ARRIVAL_DELAY)
+sd(flights.subset.B6$ARRIVAL_DELAY)
+
+# Interquartile Range
+IQR(flights.subset.AS$ARRIVAL_DELAY)
+IQR(flights.subset.B6$ARRIVAL_DELAY)
+
+# SEM
+sd(flights.subset.AS$ARRIVAL_DELAY)/sqrt(length(flights.subset.AS))
+sd(flights.subset.B6$ARRIVAL_DELAY)/sqrt(length(flights.subset.B6))
+```
+
+The summary statistics show that Alaska Airlines (as Alaska in the following for simplicity) operated 3066  flights in 2015 within the US.The JetBlue Airlines (as JetBlue in the following) operated 2612 flights in the same year regarding the desired routes.
+
+Alaska had a minimum delay of -77 minutes, meaning the plane arrived 77 min ahead of the planned arrival time. The maximum delay amounts to 791 min. This is equivalent to 13.18 h of delay. In comparison, JetBlue had a minimum delay of -59 min and a maximum delay of 367 min (equivalent to 6.12 h). The median delay for Alaska is -11 minutes. This means that 50 % of the delay are 11 min or less and the other 50 % are 11 min or greater. JetBlue shows a median delay of-3 minutes. The higher mean delay of JetBlue indicates that on average, passengers flying with JetBlue arrive 6.7 min later than scheduled, that is about 14 (-7.75-6.714) min more than passengers flying with Alaska. 
+
+The variability in arrival delays for JetBlue is slightly greater, as indicated by a larger standard deviation. 
+
+To compare both distributions, which have different samples sizes, we introduce the SEM. SEM measures the precision of the sample mean as an estimate of the population mean. A smaller SEM suggests a more precise estimate. 
+
+Alaska: 
+
+- Mean Arrival Delay: -7 minutes (arriving earlier than expected)
+
+- SEM: 23 minutes
+
+Alaska has a SEM of 23 minutes, indicating that on average, the sample mean delay of -7 minutes is expected to vary by about 23 minutes. 
+
+JetBlue:
+
+- Mean Arrival Delay: 6 minutes (arriving later than expected)
+
+- SEM: 28 minutes
+
+The SEM for the delay of JetBlue is 28 min, this means that, on average, the sample mean delay of 6 minutes is expected to vary by about 28 minutes. 
+
+In comparison, Alaska is expected to arrive 7 minutes before the scheduled time with a moderate level of uncertainty in this estimate. JetBlue arrives on average 6 later than planned and the level of uncertainty in this estimate is higher.
+
+### 3.2 Plot Histogram
+In the following, we devide the delays in classes: 
+
+- on time (delay <= 5 min)
+
+- small delay (5 < delay <= 45 min)
+
+- large delay (delay > 45 min)
+```{r histogram, echo = TRUE, include= TRUE}
+flights.with.coordinates$delay.category <- cut(flights.with.coordinates$ARRIVAL_DELAY, 
+                                               breaks = c(-Inf, 5, 45, Inf), 
+                                               labels = c("On time", "Small delay", "Large delay"))
+
+ggplot(flights.with.coordinates, aes(x = delay.category, fill = AIRLINE)) +
+  geom_bar(position = "dodge", show.legend = TRUE) +
+  labs(title = "Histogram of Delays for Both Airlines",
+       x = "Delay Category",
+       y = "Count") +
+  scale_fill_manual(values = c("AS" = "lightblue", "B6" = "orange")) +
+  theme_minimal()
+```
+
+The histogram shows that Alaska Airlines had a higher number of on-time flights in 2015 compared to B6, and fewer flights in the categories of small and large delays, despite having a greater total number of flights in that year (3066 vs. 2612). This suggests that Alaska Airlines is more reliable in terms of flight punctuality. In Chapter four, we will analyze whether the delay difference between the two airlines has statistical significance.
+``` {r scatterplot, include = TRUE}
+
+ggplot(flights.with.coordinates, aes(x=DISTANCE, y=ARRIVAL_DELAY)) + 
+  geom_point( aes(color=ifelse(ARRIVAL_DELAY > 0, "red", "#69b3a2")),
+              size = 0.5,
+    alpha = 1) +
+  theme_minimal() +
+   scale_x_continuous(breaks = seq(0, 3000, by = 500)) +
+   scale_y_continuous(breaks = seq(-100, 1100, by = 200)) +
+  theme(legend.position = "none")
+
+```
+
+### 3.3 Airline and flight distance 
+``` {r plot, include = TRUE, warning = FALSE}
+
+# see the general distance the two airlines fly
+flights.with.coordinates %>%
+  ggplot( aes(x=DISTANCE)) +
+    geom_density(fill="#69b3a2", color="#e9ecef", alpha=0.8)
+
+# distance of each airline on top of each other
+ggplot(data=flights.with.coordinates, aes(x=DISTANCE, group=AIRLINE, fill=AIRLINE)) +
+    geom_density(adjust=1.5, alpha=.4) +
+    theme_ipsum() +
+   scale_x_continuous(breaks = seq(0, 3000, by = 500)) 
+
+```
+
+
+
+``` {r heatmat, include = TRUE}
+
+ggplot(flights.with.coordinates, aes(MONTH, DISTANCE, fill= AIRLINE)) + 
+  geom_tile()
+
+ggplot(flights.with.coordinates, aes(x=ARRIVAL_DELAY, y=DISTANCE) ) +
+  geom_bin2d(bins = 70) +
+  scale_fill_continuous(type = "viridis") +
+  theme_bw()
+
+ggplot(flights.with.coordinates, aes(x=ARRIVAL_DELAY, y=DISTANCE) ) +
+  stat_density_2d(aes(fill = ..density..), geom = "raster", contour = FALSE) +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(
+    legend.position='none'
+  )
+
+# Area + contour
+ggplot(flights.with.coordinates, aes(x=ARRIVAL_DELAY, y=DISTANCE)) +
+  stat_density_2d(aes(fill = ..level..), geom = "polygon", colour="white")
+```
+
+### 3.4 Airport location on map (Chapter of choice)
+
+Because we merged the coordinates of the airport data set to our flights data set, we would like to visualize the airports in a map. We got the Cartographic Boundary of the USA from the webpage "Cartographic Boundary Files - Shapefile"[^2]
+
+[^2]: https://www.census.gov/geographies/mapping-files/time-series/geo/carto-boundary-file.2015.html#list-tab-1556094155
+
+Considering that we are working with two different airlines, we pointed the airports where each airline origins from with a different collor. Jetblue is marked with a blue dot, and Alaskan with a yellow dot. There of course are also airports from which both airlines fly from, which are marked with a blue and red dot. 
+
+```{r map USAMap, echo = TRUE, include= TRUE, cache=TRUE, message=TRUE, results=TRUE}
+
+US_counties <- st_read("shapefilesCounty/cb_2015_us_state_500k.shp")
+bbox.limits <- c(-180, 10,-50, 75)
+
+JetBlue.Flights <-  subset(flights.with.coordinates, AIRLINE == 'AS')
+Alaskan.Flights <-  subset(flights.with.coordinates, AIRLINE == 'B6')
+
+ggplot() +
+  geom_sf(data = US_counties, fill = "#E5FFCC") +
+  theme_bw() +
+  coord_sf(xlim = bbox.limits[c(1, 3)],
+           ylim = bbox.limits[c(2, 4)],
+           expand = FALSE) +
+  geom_point(
+    data = JetBlue.Flights,
+    mapping = aes(x = ORIGIN_LONGITUDE, y = ORIGIN_LATITUDE),
+    colour = "blue",
+    size = 1,
+    alpha = 1
+  ) +
+  geom_point(
+    data = Alaskan.Flights,
+    mapping = aes(x = ORIGIN_LONGITUDE, y = ORIGIN_LATITUDE),
+    colour = "red",
+    size = 1.5,
+    alpha = 1
+  ) +
+  xlab("Longitude") +
+  ylab("Latitude") 
+```
+
+### 3.5 Display difference in flight delay by month using shinyApp (Chapter of choice)
+
+Using {shiny} to create interactive plots.
+```{r shiny, echo = TRUE, include= TRUE}
+# define the UI for the Shiny app
+ui <- fluidPage(
+  titlePanel("Average Arrival Delay for Two Airlines"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      textInput("departure.airport.input", "Enter Departure Airport Name:", value = "BOS"),
+      textInput("arrival.airport.input", "Enter Arrival Airport Name:", value = "SAN"),
+      textInput("airline1.input", "Airline 1:", value = "AS"),
+      textInput("airline2.input", "Airline 2:",value = "B6"),
+      selectInput("month.input", "Select Month:", choices = unique(flights.with.coordinates$MONTH)),
+      actionButton("submit.button", "Submit")
+    ),
+    
+    mainPanel(
+      plotOutput("average.delay.plot"),
+      htmlOutput("average.wait.time.text")  
+    )
+  )
+)
+
+# define the server logic
+server <- function(input, output) {
+  observeEvent(input$submit.button, {
+    # Filter data based on selected departure and arrival airports and airlines
+    filtered.data <- flights.with.coordinates %>%
+      filter(ORIGIN_AIRPORT == input$departure.airport.input,
+             DESTINATION_AIRPORT == input$arrival.airport.input,
+             AIRLINE %in% c(input$airline1.input, input$airline2.input),
+             MONTH == input$month.input)
+    
+    # calculate average arrival delay for each airline
+    avg.delay <- filtered.data %>%
+      group_by(AIRLINE) %>%
+      summarise(avg.arrival.delay = mean(ARRIVAL_DELAY))
+    
+    # create the plot
+    output$average.delay.plot <- renderPlot({
+      barplot(avg.delay$avg.arrival.delay, 
+              names.arg = avg.delay$AIRLINE,
+              main = "Average Arrival Delay for Selected Airlines",
+              xlab = "Airline",
+              ylab = "Average Arrival Delay",
+              col = c("lightblue", "orange"),
+              ylim = c(0, max(avg.delay$avg.arrival.delay, na.rm = TRUE) + 10))
+    })
+    
+    # update the average wait time text with HTML formatting and difference calculation
+    output$average.wait.time.text <- renderText({
+      airline1.avg.time <- avg.delay$avg.arrival.delay[avg.delay$AIRLINE == input$airline1.input]
+      airline2.avg.time <- avg.delay$avg.arrival.delay[avg.delay$AIRLINE == input$airline2.input]
+      
+      difference <- -1*(airline1.avg.time - airline2.avg.time)
+      
+      paste("The average wait time for", input$airline1.input, "from",
+            input$departure.airport.input, "to", input$arrival.airport.input, "in",input$month.input, 
+            "is <span style='color:green; font-weight:bold;'>",
+            round(airline1.avg.time, 2), " min</span>. ",
+            "The average wait time for", input$airline2.input, "from",
+            input$departure.airport.input, "to", input$arrival.airport.input, "in",input$month.input,
+            "is <span style='color:green; font-weight:bold;'>",
+            round(airline2.avg.time, 2), " min</span>. ",
+            "You save on average <span style='color:red; font-weight:bold;'>",
+            round(difference, 2), " min</span> time using Alaska airline.")
+    })
+  })
+}
+
+# run the Shiny app
+shinyApp(ui, server)
+```
+
+With the help of the shinyApp, Jim can see the average delay for a specific route in a specific month (except for October) of both airlines. 
+
+When choosing a route, e.g. BOS - SAN (Boston to San Diego) in e.g. January, the app shows the following result:
+
+*The average wait time for AS from BOS to SAN in 1 is 16.83 min. The average wait time for B6 from BOS to SAN in 1 is -1.34 min. You save on average -18.17 min time using Alaska airline.*
+
+A negative number here means that Jim would loose this amount of time flying with Alaska compared to JetBlue airline.
+
+When choosing the month July for the same route, the result shows:
+
+*The average wait time for AS from BOS to SAN in 7 is -10.7 min. The average wait time for B6 from BOS to SAN in 7 is 3.72 min. You save on average 14.42 min time using Alaska airline.*
+
+The result indicates, that flying with Alaska airline in July from BOS to SAN would save on average about 15 min compared to flying with JetBlue airline.
+
+### 3.6 Cancellation Rate
+James has concerns about his flight being cancelled for the next important trip. Let us look at the cancellation rate for both airlines in 2015.
+```{r cancallation rate, echo = TRUE, include= TRUE}
+# calculate cancellation rate in year 2015
+cancel.rate.year <- flights.with.coordinates%>%
+  group_by(AIRLINE)%>%
+  summarise(cancel.rate = sum(CANCELLED)/length(CANCELLED))
+cancel.rate.year
+```
+
+The result shows that in 2015, neither Alaska nor JetBlue airlines has cancelled their flights. This adds trustworthiness to both airlines. James's should not be worried about cancellation of his flight whether he is flying with Alaska or JetBlue, as the probability of a flight being cancelled is basically zero. 
+
+## 4. Analysis
+In the following, we would like to apply a t-test on the delay between the two airlines to determine whether the difference in delay is statistically significant. 
+```{r t-test year, echo = TRUE, include= TRUE}
+# T test for the difference in total delay in 2015 of Alaska and JetBlue airline
+yearly_test <- t.test(flights.AS.month$ARRIVAL_DELAY, flights.B6.month$ARRIVAL_DELAY)
+yearly_test
+```
+The t-test result indicates, that in year 2015, the difference of delay between both airlines is highly statistically different from 0 with a p value of < 2.2e-16.
+
+In the following, we conduct t-tests for the delay difference in each month of 2015.
+```{r t-test monthly, echo = TRUE, include= TRUE}
+# perform t test for the difference in total delay in each month in 2015 of Alaska and JetBlue airline
+monthly_tests <- lapply(1:12, function(month) {
+  # Subset data for the specific month
+  data_month_AS <- subset(flights.AS.month, MONTH == month) 
+  data_month_B6 <- subset(flights.B6.month, MONTH == month) 
+  
+  # check if both groups have enough observations
+  if (nrow(data_month_AS) >= 2 & nrow(data_month_B6) >= 2) {
+    # Perform t-test
+    t_test_result <- t.test(data_month_AS$ARRIVAL_DELAY, data_month_B6$ARRIVAL_DELAY)
+    return(t_test_result)
+  } else {
+    # return a message indicating insufficient data
+    return(paste("Insufficient data for month", month.abb[month]))
+  }
+})
+
+# print the p value of t-test results for each month
+names(monthly_tests) <- month.abb
+
+for (i in names(monthly_tests)) {
+  if ("p.value" %in% names(monthly_tests[[i]])) {
+    print(paste(i, ": ", monthly_tests[[i]]$p.value))
+  } else {
+    cat(i, ": None\n")
+  }
+}
+
+```
+
+Except for the month of October, where there is no sufficient data available to perform a test, a t-test is applied to investigate the delay difference in each month.
+```{r}
+# investigate the months
+unique(flights.AS.month$MONTH)
+unique(flights.B6.month$MONTH)
+unique(flights$MONTH)
+```
+For both airlines the flight data for October is missing regarding these routes
+All months except for January (p-value = 0.1832) show a significant delay difference of both airlines. When looking at the mean of x and y of the Welch Two Sample t-test result, these months have a lower x than y value. 
+
+```{r t-test monthly estimates, echo = TRUE, include= TRUE}
+for (i in names(monthly_tests)) {
+  if ("p.value" %in% names(monthly_tests[[i]])) {
+    print(paste(i, ": ", monthly_tests[[i]]$estimate))
+  } else {
+    cat(i, ": None\n")
+  }
+}
+```
+This implies, that the delay of Alaska airline (x) is significantly lower than the delay of JetBlue (y) in these months.
+It means in general for Jim that if he wants to significantly reduce the arrival delay in the months of February, March, April, May, June, July, August, September, November and December he should choose the Alaska airline.
+
+Jim has an important meeting in Boston in January and wants to make sure, that he does not miss this meeting. He will be flying from San Diego. We would like to look into the following question: Is there a significant difference in arrival delay between flights from SAN to BOS operated by either Alaska or JetBlue airline in January? 
+We perform a t-test to decide, which airline should be favored when purchasing the ticket for the important meeting.
+```{r t-test SAN to BOS alpha 5, echo = TRUE, include= TRUE}
+# specify the route
+departure_airport <- "SAN"
+arrival_airport <- "BOS"
+# create the subsets regarding the conditions: airline, departure, destination, month
+SEA.JFK.JAN.AS <- flights.with.coordinates %>%
+  filter(AIRLINE=="AS", ORIGIN_AIRPORT== departure_airport, DESTINATION_AIRPORT == arrival_airport, MONTH == 1) %>%
+  select(AIRLINE, ARRIVAL_DELAY, ORIGIN_AIRPORT, DESTINATION_AIRPORT)
+SEA.JFK.JAN.B6 <- flights.with.coordinates %>%
+  filter(AIRLINE=="B6", ORIGIN_AIRPORT== departure_airport, DESTINATION_AIRPORT == arrival_airport, MONTH == 1) %>%
+  select(AIRLINE, ARRIVAL_DELAY, ORIGIN_AIRPORT, DESTINATION_AIRPORT)
+# number of observations in each subset
+nrow(SEA.JFK.JAN.AS)
+nrow(SEA.JFK.JAN.B6)
+
+# apply t-test
+t.test(SEA.JFK.JAN.AS$ARRIVAL_DELAY, SEA.JFK.JAN.B6$ARRIVAL_DELAY)
+```
+The Welch two sample t-test shows that the two airlines do not have a significant delay when it comes to flights operated in January from SAN to BOS.
+In the following, we would like to see if we increase the significance level from 5 to 10%, if the delay would be significant. 
+```{r t-test SAN to BOS alpa 10, echo = TRUE, include= TRUE}
+t.test(SEA.JFK.JAN.AS$ARRIVAL_DELAY, SEA.JFK.JAN.B6$ARRIVAL_DELAY, conf.level = 0.9)
+```
+There is still no statistical difference between the delays of both airlines. The results of both t-test suggest, that the delay difference of the two airlines in January 2015 is rather due to randomness. Thus, it does not matter, which airline Jim chooses for his travel from SAN to BOS in January. 
+
+## 5. Summary
+In this project, we conducted an analysis on flight delays focusing on routes that are relevant to Jim's business travels. Our goal is to determine which airline JIM should choose for specific routes or month of the year in order to reduce delays at arrival airports. We found that Alaska and JetBlue operate flights for these routes, so we investigated the delays of these airlines wrt. the routes. With the help of our analysis, Jim is able make data-based decisions on the choice of the airline regarding his business travels. 
+
+In order to determine the approximate arrival delay, Jim can use the shinyApp to see, how much delay is expected for a specific route in a specific month. In that way, he can better schedule activities after his arrival, e.g. airport pick-up or meeting. 
+
+All in all, we could see, that Alaska airline is expected to have significant less delays in most months. Therefore, we advise Jim to join the loyalty program of Alaska Airlines, to enjoy benefits such as lounge access. 
+
+## 6. Generative AI
+We initially used Generative AI to brainstorm suitable topics for the assignment. It didn't directly lead us to our final topic, but it gave us some ideas in which direction to go to and pushed us think about, what we should to include in our data analysis.
+
+For the coding part, it was actually very helpful to use generative AI like ChatGPT. It not only helped us understand the basics of what we needed to do, it also gave us hints on what parts of the program we should further investigate, when there is an error. This helped us to efficiently work on the project without spending most of the time resolving the errors.
+
+To make sure that the suggestions of generative AI were correct, it also required us to look up in existing documentation and other resources to better understand the suggestion and make sure, that it achieves what we want to do with it.
+
+While generative AI tools can be very useful, it also has limitations. For example, when it comes to understand a problem that has a more complex pattern or requires domain-specific knowledge, it does not provide valuable insights. In these cases, professionals rely on their own expertise for analysis and interpretation of results.
